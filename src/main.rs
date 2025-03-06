@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 type Store = Arc<Mutex<HashMap<String, String>>>;
 
 async fn match_command(command: &str, store: &Store) -> String {
-    let mut parts = command.splitn(3, " ");
+    let mut parts = command.trim().splitn(3, " ");
     let cmd = parts.next();
 
     match cmd {
@@ -17,7 +17,7 @@ async fn match_command(command: &str, store: &Store) -> String {
                 db.insert(key.to_string(), value.to_string());
                 "OK".to_string()
             } else {
-                "ERROR: Invalid SET command".to_string()
+                "ERROR: Usage: SET <key> <value>".to_string()
             }
         }
         Some("GET") => {
@@ -25,10 +25,11 @@ async fn match_command(command: &str, store: &Store) -> String {
                 let db = store.lock().await;
                 db.get(key).cloned().unwrap_or("NULL".to_string())
             } else {
-                "ERROR: Invalid GET command".to_string()
+                "ERROR: Usage: GET <key>".to_string()
             }
         }
-        _ => "ERROR: Unknown command".to_string(),
+        Some("") | None => "ERROR: Empty command".to_string(),
+        _ => "ERROR: Unknown command. Use SET <key> <value> or GET <key>".to_string(),
     }
 }
 
@@ -36,10 +37,13 @@ async fn handle_client(stream: TcpStream, store: Store) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
 
+    writer.write_all(b"> ").await.unwrap();
+
     while let Ok(Some(line)) = reader.next_line().await {
         println!("Received: {}", line);
         let response = match_command(&line, &store).await;
-        writer.write_all(format!("{}\n", response).as_bytes()).await.unwrap();
+        
+        writer.write_all(format!("{}\n> ", response).as_bytes()).await.unwrap();
     }
 
     println!("Client disconnected.");
