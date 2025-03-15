@@ -1,12 +1,13 @@
 use dotenv::dotenv;
-use serde_json;
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
@@ -49,31 +50,59 @@ async fn cleanup_expired_keys(store: Store) {
 
 fn get_db_file_path() -> String {
     dotenv().ok();
-    env::var("DB_FILE").unwrap_or_else(|_| "db.json".to_string())
+    env::var("DB_FILE").unwrap_or_else(|_| "db.aof".to_string())
 }
 
-async fn save_to_file(store: &Store) {
+async fn append_to_file(content: String) -> Result<(), std::io::Error> {
     let db_file = get_db_file_path();
-    let db = store.lock().await;
-    let json = serde_json::to_string(&*db).unwrap();
-    fs::write(db_file, json).await.unwrap();
+
+    let mut file = OpenOptions::new()
+        .create(true) // Create the file if it doesn't exist
+        .append(true) // Append to the file instead of overwriting
+        .open(db_file)
+        .await?;
+
+    file.write_all(content.as_bytes()).await?;
+    Ok(())
 }
 
 async fn load_from_file() -> HashMap<String, (String, Option<u64>)> {
     let db_file = get_db_file_path();
+    let mut db = HashMap::new();
 
     match fs::read_to_string(&db_file).await {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(data) => data,
-            Err(_) => {
-                println!("Warning: Corrupted database file. Starting fresh.");
-                HashMap::new()
+        Ok(content) => {
+            for line in content.lines() {
+                let mut parts = line.split_whitespace();
+                match parts.next() {
+                    Some("SET") => {
+                        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                            db.insert(key.to_string(), (value.to_string(), None));
+                        }
+                    }
+                    Some("DEL") => {
+                        if let Some(key) = parts.next() {
+                            db.remove(key);
+                        }
+                    }
+                    Some("EXPIRE") => {
+                        if let (Some(key), Some(seconds)) = (parts.next(), parts.next()) {
+                            if let Ok(seconds) = seconds.parse::<u64>() {
+                                if let Some((value, _)) = db.get(key).cloned() {
+                                    db.insert(
+                                        key.to_string(),
+                                        (value, Some(current_timestamp() + seconds)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
-        },
-        Err(_) => {
-            println!("No database file found at '{}'. Starting fresh.", db_file);
-            HashMap::new()
+            db
         }
+        Err(_) => HashMap::new(),
     }
 }
 
@@ -82,12 +111,21 @@ async fn compact_log(store: Store) {
         sleep(Duration::from_secs(60)).await; // Compaction interval
 
         let db_file = get_db_file_path();
-        let db = store.lock().await;
-        let json = serde_json::to_string(&*db).unwrap();
-
-        // Write to a temporary file first to avoid corruption
         let tmp_file = format!("{}.tmp", db_file);
-        if let Err(e) = fs::write(&tmp_file, &json).await {
+
+        let db = store.lock().await;
+        let mut compacted_content = String::new();
+
+        for (key, (value, expires_at)) in db.iter() {
+            compacted_content.push_str(&format!("SET {} {}\n", key, value));
+            if let Some(expiry) = expires_at {
+                let remaining_time = expiry.saturating_sub(current_timestamp());
+                compacted_content.push_str(&format!("EXPIRE {} {}\n", key, remaining_time));
+            }
+        }
+
+        // Write the compacted content to a temporary file
+        if let Err(e) = fs::write(&tmp_file, compacted_content).await {
             eprintln!("Failed to write compacted log: {}", e);
             continue;
         }
@@ -97,23 +135,6 @@ async fn compact_log(store: Store) {
             eprintln!("Failed to replace log file: {}", e);
         } else {
             println!("Log compaction completed.");
-        }
-    }
-}
-
-async fn take_snapshot(store: Store) {
-    loop {
-        sleep(Duration::from_secs(300)).await; // Snapshot interval (every 5 minutes)
-
-        let timestamp = current_timestamp();
-        let snapshot_file = format!("snapshot_{}.json", timestamp);
-        let db = store.lock().await;
-        let json = serde_json::to_string(&*db).unwrap();
-
-        if let Err(e) = fs::write(&snapshot_file, &json).await {
-            eprintln!("Failed to write snapshot file: {}", e);
-        } else {
-            println!("Snapshot saved to {}", snapshot_file);
         }
     }
 }
@@ -216,8 +237,11 @@ async fn match_command(
                 db.insert(key.to_string(), (value.to_string(), None));
                 drop(db);
 
-                save_to_file(store).await;
-
+                let result = append_to_file(format!("SET {} {}\n", key, value)).await;
+                match result {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Failed to append to file: {}", e),
+                }
                 "OK".to_string()
             } else {
                 "ERROR: Usage: SET <key> <value>".to_string()
@@ -231,7 +255,11 @@ async fn match_command(
                         if current_timestamp() > *expiry {
                             db.remove(key); // Key has expired, remove it
                             drop(db);
-                            save_to_file(store).await;
+                            let result = append_to_file(format!("DEL {}\n", key)).await;
+                            match result {
+                                Ok(_) => (),
+                                Err(e) => eprintln!("Failed to append to file: {}", e),
+                            }
                             return "NULL".to_string();
                         }
                     }
@@ -248,7 +276,11 @@ async fn match_command(
                 db.remove(key);
                 drop(db);
 
-                save_to_file(store).await;
+                let result = append_to_file(format!("DEL {}\n", key)).await;
+                match result {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Failed to append to file: {}", e),
+                }
 
                 "OK".to_string()
             } else {
@@ -266,7 +298,11 @@ async fn match_command(
                         );
                         drop(db);
 
-                        save_to_file(store).await;
+                        let result = append_to_file(format!("EXPIRE {} {}\n", key, seconds)).await;
+                        match result {
+                            Ok(_) => (),
+                            Err(e) => eprintln!("Failed to append to file: {}", e),
+                        }
 
                         return "OK".to_string();
                     } else {
@@ -345,12 +381,6 @@ async fn main() {
     let store_clone = Arc::clone(&store);
     tokio::spawn(async move {
         compact_log(store_clone).await;
-    });
-
-    // Spawn background task for taking snapshots
-    let store_clone = Arc::clone(&store);
-    tokio::spawn(async move {
-        take_snapshot(store_clone).await;
     });
 
     println!("Listening on 127.0.0.1:6379...");
