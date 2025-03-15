@@ -77,6 +77,47 @@ async fn load_from_file() -> HashMap<String, (String, Option<u64>)> {
     }
 }
 
+async fn compact_log(store: Store) {
+    loop {
+        sleep(Duration::from_secs(60)).await; // Compaction interval
+
+        let db_file = get_db_file_path();
+        let db = store.lock().await;
+        let json = serde_json::to_string(&*db).unwrap();
+
+        // Write to a temporary file first to avoid corruption
+        let tmp_file = format!("{}.tmp", db_file);
+        if let Err(e) = fs::write(&tmp_file, &json).await {
+            eprintln!("Failed to write compacted log: {}", e);
+            continue;
+        }
+
+        // Replace the old file with the compacted one
+        if let Err(e) = fs::rename(&tmp_file, &db_file).await {
+            eprintln!("Failed to replace log file: {}", e);
+        } else {
+            println!("Log compaction completed.");
+        }
+    }
+}
+
+async fn take_snapshot(store: Store) {
+    loop {
+        sleep(Duration::from_secs(300)).await; // Snapshot interval (every 5 minutes)
+
+        let timestamp = current_timestamp();
+        let snapshot_file = format!("snapshot_{}.json", timestamp);
+        let db = store.lock().await;
+        let json = serde_json::to_string(&*db).unwrap();
+
+        if let Err(e) = fs::write(&snapshot_file, &json).await {
+            eprintln!("Failed to write snapshot file: {}", e);
+        } else {
+            println!("Snapshot saved to {}", snapshot_file);
+        }
+    }
+}
+
 async fn match_command(
     command: &str,
     store: &Store,
@@ -298,6 +339,18 @@ async fn main() {
     let store_clone = Arc::clone(&store);
     tokio::spawn(async move {
         cleanup_expired_keys(store_clone).await;
+    });
+
+    // Spawn background task for log compaction
+    let store_clone = Arc::clone(&store);
+    tokio::spawn(async move {
+        compact_log(store_clone).await;
+    });
+
+    // Spawn background task for taking snapshots
+    let store_clone = Arc::clone(&store);
+    tokio::spawn(async move {
+        take_snapshot(store_clone).await;
     });
 
     println!("Listening on 127.0.0.1:6379...");
