@@ -2,14 +2,25 @@ use dotenv::dotenv;
 use serde_json;
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 
+type Sender = broadcast::Sender<String>;
+
+// Struct to represent a subscription with multiple subscribers
+struct Subscription {
+    sender: Sender,
+    subscribers: HashMap<u64, mpsc::UnboundedSender<String>>,
+}
+
+type Subscriptions = Arc<Mutex<HashMap<String, Subscription>>>;
 type Store = Arc<Mutex<HashMap<String, (String, Option<u64>)>>>;
 
 fn current_timestamp() -> u64 {
@@ -66,11 +77,98 @@ async fn load_from_file() -> HashMap<String, (String, Option<u64>)> {
     }
 }
 
-async fn match_command(command: &str, store: &Store) -> String {
+async fn match_command(
+    command: &str,
+    store: &Store,
+    subscriptions: &Subscriptions,
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    client_id: u64,
+) -> String {
     let mut parts = command.trim().splitn(3, " ");
     let cmd = parts.next();
-
     match cmd {
+        Some("SUBSCRIBE") => {
+            if let Some(channel) = parts.next() {
+                let mut subs = subscriptions.lock().await;
+                let (client_sender, mut client_receiver) = mpsc::unbounded_channel::<String>();
+
+                // If channel exists, add the subscriber
+                let subscription = subs.entry(channel.to_string()).or_insert_with(|| {
+                    let (sender, mut broadcast_receiver) = broadcast::channel::<String>(100);
+                    let subs_clone = Arc::clone(&subscriptions);
+                    let channel_clone = channel.to_string();
+
+                    // Spawn one task per channel to broadcast messages
+                    tokio::spawn(async move {
+                        while let Ok(message) = broadcast_receiver.recv().await {
+                            let subs = subs_clone.lock().await;
+                            if let Some(sub) = subs.get(&channel_clone) {
+                                for subscriber in sub.subscribers.values() {
+                                    let _ = subscriber.send(message.clone());
+                                }
+                            }
+                        }
+                    });
+
+                    Subscription {
+                        sender,
+                        subscribers: HashMap::new(),
+                    }
+                });
+
+                // Add subscriber
+                subscription.subscribers.insert(client_id, client_sender);
+                let channel_clone = channel.to_string();
+
+                // Spawn lightweight task to listen for messages and write to client
+                let writer_clone = Arc::clone(&writer);
+                tokio::spawn(async move {
+                    while let Some(message) = client_receiver.recv().await {
+                        let mut writer_lock = writer_clone.lock().await;
+                        writer_lock
+                            .write_all(
+                                format!("CHANNEL: {}, MESSAGE: {}\n> ", channel_clone, message)
+                                    .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+
+                "OK".to_string()
+            } else {
+                "ERROR: Usage: SUBSCRIBE <channel>".to_string()
+            }
+        }
+        Some("PUBLISH") => {
+            if let (Some(channel), Some(message)) = (parts.next(), parts.next()) {
+                let subs = subscriptions.lock().await;
+                if let Some(sub) = subs.get(channel) {
+                    let _ = sub.sender.send(message.to_string());
+                    "OK".to_string()
+                } else {
+                    "ERROR: No subscribers found for the channel.".to_string()
+                }
+            } else {
+                "ERROR: Usage: PUBLISH <channel> <message>".to_string()
+            }
+        }
+        Some("UNSUBSCRIBE") => {
+            if let Some(channel) = parts.next() {
+                let mut subs = subscriptions.lock().await;
+                if let Some(sub) = subs.get_mut(channel) {
+                    sub.subscribers.remove(&client_id);
+                    if sub.subscribers.is_empty() {
+                        subs.remove(channel);
+                    }
+                    "OK".to_string()
+                } else {
+                    "ERROR: No subscribers found for the channel.".to_string()
+                }
+            } else {
+                "ERROR: Usage: UNSUBSCRIBE <channel>".to_string()
+            }
+        }
         Some("SET") => {
             if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                 let mut db = store.lock().await;
@@ -145,20 +243,45 @@ async fn match_command(command: &str, store: &Store) -> String {
     }
 }
 
-async fn handle_client(stream: TcpStream, store: Store) {
-    let (reader, mut writer) = stream.into_split();
+async fn handle_client(
+    stream: TcpStream,
+    store: Store,
+    subscriptions: Subscriptions,
+    client_id: u64,
+) {
+    println!("Client {} connected. ", client_id);
+    let (reader, writer) = stream.into_split();
+    let writer = Arc::new(Mutex::new(writer));
     let mut reader = BufReader::new(reader).lines();
 
-    writer.write_all(b"> ").await.unwrap();
+    {
+        let mut writer_lock = writer.lock().await;
+        writer_lock.write_all(b"> ").await.unwrap();
+    }
 
     while let Ok(Some(line)) = reader.next_line().await {
         println!("Received: {}", line);
-        let response = match_command(&line, &store).await;
+        let response = match_command(
+            &line,
+            &store,
+            &subscriptions,
+            Arc::clone(&writer),
+            client_id,
+        )
+        .await;
 
-        writer
-            .write_all(format!("{}\n> ", response).as_bytes())
-            .await
-            .unwrap();
+        {
+            let mut writer_lock = writer.lock().await;
+            writer_lock
+                .write_all(format!("{}\n> ", response).as_bytes())
+                .await
+                .unwrap();
+        }
+
+        if response == "GOODBYE" {
+            println!("Client disconnected.");
+            break;
+        }
     }
 
     println!("Client disconnected.");
@@ -168,6 +291,8 @@ async fn handle_client(stream: TcpStream, store: Store) {
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let store: Store = Arc::new(Mutex::new(load_from_file().await));
+    let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let client_counter = Arc::new(AtomicU64::new(1));
 
     // Spawn background task for cleaning up expired keys
     let store_clone = Arc::clone(&store);
@@ -180,8 +305,10 @@ async fn main() {
     loop {
         let (stream, _) = listener.accept().await.unwrap();
         let store = Arc::clone(&store);
+        let client_id = client_counter.fetch_add(1, Ordering::Relaxed);
+        let subscriptions = Arc::clone(&subscriptions);
         tokio::spawn(async move {
-            handle_client(stream, store).await;
+            handle_client(stream, store, subscriptions, client_id).await;
         });
     }
 }
